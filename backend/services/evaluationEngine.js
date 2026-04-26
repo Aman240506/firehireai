@@ -2,61 +2,66 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-async function evaluateCandidate(parsedResume, jobDescription, config = {}) {
-    const {
-        ignoreName = false,
-        ignoreCollege = false,
-        ignoreGaps = false
-    } = config;
-
-    // Create a modified copy of the resume based on simulation config
-    const simulatedResume = JSON.parse(JSON.stringify(parsedResume));
-
-    if (ignoreName) {
-        simulatedResume.name = "[REDACTED]";
-    }
-    if (ignoreCollege && simulatedResume.education) {
-        simulatedResume.education.college = "[REDACTED]";
-    }
-
-    const gapInstruction = ignoreGaps 
-        ? "CRITICAL INSTRUCTION: Explicitly ignore any employment gaps or lack of experience if they are a fresher. Do not penalize the score for gaps." 
-        : "Evaluate employment gaps as you normally would for this role.";
+/**
+ * Evaluates a structured candidate against a job description.
+ * @param {Object} candidateData The JSON representation of the candidate.
+ * @param {string} jobDescription The raw job description text.
+ * @returns {Promise<Object>} An evaluation object containing matchScore and skill sets.
+ */
+async function evaluateCandidate(candidateData, jobDescription) {
+  try {
+    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
     const prompt = `
-You are an unbiased expert technical recruiter. Evaluate the candidate's fit for the job description based ONLY on their skills and relevant experience.
-Do not explicitly assume gender or penalize for factors unrelated to job performance.
+You are an expert technical recruiter and unbiased AI hiring assistant.
+Evaluate the candidate against the job description.
+Focus ONLY on skills, experience relevance, and core qualifications.
+Do NOT be influenced by the candidate's name, gender, college name, or employment gaps.
 
-${gapInstruction}
+You MUST return ONLY a valid JSON object. No markdown fences.
 
-Candidate Profile (JSON):
-${JSON.stringify(simulatedResume, null, 2)}
+Return this exact schema:
+{
+  "matchScore": <number between 0 and 100 representing overall fit based purely on skills and experience relevance>,
+  "matchingSkills": [<array of strings of key skills they possess that match the JD>],
+  "missingSkills": [<array of strings of key skills they lack that are required in the JD>]
+}
+
+Candidate Data (JSON format):
+${JSON.stringify(candidateData, null, 2)}
 
 Job Description:
 ${jobDescription}
-
-Return ONLY a valid JSON object matching this exact structure:
-{
-  "matchScore": number (0-100),
-  "matchingSkills": ["skill1", "skill2"],
-  "missingSkills": ["skill3", "skill4"]
-}
 `;
 
-    try {
-        const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
-        const result = await model.generateContent({
-            contents: [{ role: "user", parts: [{ text: prompt }] }],
-            generationConfig: {
-                responseMimeType: "application/json",
-            }
-        });
-
-        return JSON.parse(result.response.text());
-    } catch (error) {
-        console.error("Error evaluating candidate with Gemini:", error);
-        throw error;
+    const result = await model.generateContent(prompt);
+    let cleanText = result.response.text().trim();
+    
+    // Clean markdown if present
+    if (cleanText.startsWith('```json')) {
+      cleanText = cleanText.replace(/^```json\n/, '').replace(/\n```$/, '');
+    } else if (cleanText.startsWith('```')) {
+      cleanText = cleanText.replace(/^```.*\n/, '').replace(/\n```$/, '');
     }
+
+    const evaluation = JSON.parse(cleanText);
+    
+    // Ensure matchScore is a number
+    if (typeof evaluation.matchScore !== 'number') {
+      evaluation.matchScore = parseInt(evaluation.matchScore, 10) || 50;
+    }
+
+    return evaluation;
+
+  } catch (error) {
+    console.error('Error in evaluateCandidate (Gemini):', error);
+    // Return a safe fallback rather than failing the whole simulation run
+    return {
+      matchScore: 0,
+      matchingSkills: [],
+      missingSkills: []
+    };
+  }
 }
 
 module.exports = { evaluateCandidate };

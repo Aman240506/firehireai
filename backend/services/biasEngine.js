@@ -1,89 +1,105 @@
 const { evaluateCandidate } = require('./evaluationEngine');
 
-async function runBiasSimulations(parsedResume, jobDescription) {
-    // 1. Baseline Evaluation
-    const baseline = await evaluateCandidate(parsedResume, jobDescription, {
-        ignoreName: false,
-        ignoreCollege: false,
-        ignoreGaps: false
+/**
+ * Creates a deep copy of the candidate data.
+ */
+const cloneCandidate = (candidate) => JSON.parse(JSON.stringify(candidate));
+
+/**
+ * Runs the baseline evaluation and multiple anonymized simulations to detect bias.
+ * @param {Object} parsedCandidate The fully parsed candidate JSON.
+ * @param {string} jobDescription The job description text.
+ * @returns {Promise<Object>} The final aggregated dashboard payload.
+ */
+async function runBiasSimulations(parsedCandidate, jobDescription) {
+  // 1. Baseline Evaluation (No modifications)
+  console.log('Running Baseline Evaluation...');
+  const baselineEval = await evaluateCandidate(parsedCandidate, jobDescription);
+  const baselineScore = baselineEval.matchScore;
+
+  // Set up array for bias factors found during simulation
+  const biasFactors = [];
+
+  // --- SIMULATION A: Name / Gender Anonymization ---
+  // Modifies the candidate by removing their name to see if the AI scores them differently.
+  const simACandidate = cloneCandidate(parsedCandidate);
+  simACandidate.name = "Candidate A";
+  console.log('Running Simulation A (Name Anonymized)...');
+  const simAEval = await evaluateCandidate(simACandidate, jobDescription);
+  
+  const simAScoreDiff = simAEval.matchScore - baselineScore;
+  // If anonymizing the name INCREASES the score, it means the original name introduced negative bias.
+  if (simAScoreDiff > 0) {
+    biasFactors.push({
+      type: 'Name / Gender',
+      impact: `+${simAScoreDiff}%`,
+      reason: 'When the candidate\'s name was anonymized, the system scored their skills higher. This indicates potential implicit bias against the original name/inferred demographic.'
     });
+  } else if (simAScoreDiff < 0) {
+     biasFactors.push({
+      type: 'Name / Gender',
+      impact: `${simAScoreDiff}%`,
+      reason: 'When the candidate\'s name was anonymized, the system scored them lower. This indicates potential implicit bias favoring the original name.'
+    });
+  }
 
-    const simulations = [];
-    let overallBiasImpact = 0;
-    const biasFactors = [];
+  // --- SIMULATION B: College / University Anonymization ---
+  // Replaces specific institution names with "Tier-1 University" or similar generic terms.
+  const simBCandidate = cloneCandidate(parsedCandidate);
+  if (simBCandidate.education && Array.isArray(simBCandidate.education)) {
+    simBCandidate.education.forEach(edu => {
+      edu.institution = "Accredited University";
+    });
+  }
+  console.log('Running Simulation B (College Anonymized)...');
+  const simBEval = await evaluateCandidate(simBCandidate, jobDescription);
+  
+  const simBScoreDiff = simBEval.matchScore - baselineScore;
+  if (simBScoreDiff > 0) {
+    biasFactors.push({
+      type: 'College / Pedigree',
+      impact: `+${simBScoreDiff}%`,
+      reason: 'Anonymizing the university name resulted in a higher match score, suggesting the system initially undervalued the candidate due to college prestige bias.'
+    });
+  }
 
-    // 2. Mod A: Remove Name
-    if (parsedResume.name) {
-        const noNameResult = await evaluateCandidate(parsedResume, jobDescription, {
-            ignoreName: true
-        });
-        const scoreDiff = noNameResult.matchScore - baseline.matchScore;
-        if (Math.abs(scoreDiff) > 0) {
-            biasFactors.push({
-                type: "Gender/Name Bias",
-                impact: scoreDiff > 0 ? `+${scoreDiff}%` : `${scoreDiff}%`,
-                reason: `Score ${scoreDiff > 0 ? 'increased' : 'decreased'} after removing candidate name.`
-            });
-            overallBiasImpact = Math.max(overallBiasImpact, Math.abs(scoreDiff));
-        }
-    }
+  // --- SIMULATION C: Employment Gaps ---
+  // Removes references to gaps to see if penalization was occurring for non-skill reasons.
+  const simCCandidate = cloneCandidate(parsedCandidate);
+  simCCandidate.gaps = []; // Wipe the gaps
+  console.log('Running Simulation C (Gaps Ignored)...');
+  const simCEval = await evaluateCandidate(simCCandidate, jobDescription);
+  
+  const simCScoreDiff = simCEval.matchScore - baselineScore;
+  if (simCScoreDiff > 0) {
+    biasFactors.push({
+      type: 'Employment Gaps',
+      impact: `+${simCScoreDiff}%`,
+      reason: 'Ignoring chronological employment gaps raised the candidate\'s score, indicating they were being penalized for time off rather than lack of technical capability.'
+    });
+  }
 
-    // 3. Mod B: Remove College
-    if (parsedResume.education && parsedResume.education.college) {
-        const noCollegeResult = await evaluateCandidate(parsedResume, jobDescription, {
-            ignoreCollege: true
-        });
-        const scoreDiff = noCollegeResult.matchScore - baseline.matchScore;
-        if (Math.abs(scoreDiff) > 0) {
-            biasFactors.push({
-                type: "College Tier Bias",
-                impact: scoreDiff > 0 ? `+${scoreDiff}%` : `${scoreDiff}%`,
-                reason: `Score ${scoreDiff > 0 ? 'increased' : 'decreased'} after removing college name.`
-            });
-            overallBiasImpact = Math.max(overallBiasImpact, Math.abs(scoreDiff));
-        }
-    }
+  // Determine Overall Bias Risk
+  let biasScore = 'Low';
+  let recommendation = 'Proceed with candidate. The match score appears to be purely based on technical merit.';
+  
+  if (biasFactors.length >= 2 || biasFactors.some(f => parseInt(f.impact) >= 10)) {
+    biasScore = 'High';
+    recommendation = 'Strong bias detected. We recommend manually reviewing this candidate\'s skills without looking at their demographic data or college name.';
+  } else if (biasFactors.length === 1) {
+    biasScore = 'Medium';
+    recommendation = 'Moderate bias detected. Be aware of the highlighted factors when making your final decision.';
+  }
 
-    // 4. Mod C: Ignore Experience Gaps
-    if (parsedResume.gaps_detected || parsedResume.experience_years === 0) {
-        const noGapsResult = await evaluateCandidate(parsedResume, jobDescription, {
-            ignoreGaps: true
-        });
-        const scoreDiff = noGapsResult.matchScore - baseline.matchScore;
-        if (Math.abs(scoreDiff) > 0) {
-            biasFactors.push({
-                type: "Experience Gap Bias",
-                impact: scoreDiff > 0 ? `+${scoreDiff}%` : `${scoreDiff}%`,
-                reason: `Score ${scoreDiff > 0 ? 'increased' : 'decreased'} when explicitly told to ignore gaps or lack of experience.`
-            });
-            overallBiasImpact = Math.max(overallBiasImpact, Math.abs(scoreDiff));
-        }
-    }
-
-    // Determine Bias Score Level
-    let biasScore = "Low";
-    if (overallBiasImpact >= 15) {
-        biasScore = "High";
-    } else if (overallBiasImpact >= 5) {
-        biasScore = "Medium";
-    }
-
-    // Generate Recommendation
-    let recommendation = "Candidate should be evaluated primarily on their technical skills.";
-    if (biasScore === "High" || biasScore === "Medium") {
-        recommendation = "Decision may be influenced by non-relevant factors. Re-evaluate based strictly on the matching skills.";
-    } else if (baseline.matchScore > 75) {
-        recommendation = "Shortlist candidate based on strong skill alignment.";
-    }
-
-    return {
-        matchScore: baseline.matchScore,
-        matchingSkills: baseline.matchingSkills,
-        missingSkills: baseline.missingSkills,
-        biasScore: biasScore,
-        biasFactors: biasFactors,
-        recommendation: recommendation
-    };
+  // Return the final aggregated payload for the dashboard
+  return {
+    matchScore: baselineScore,
+    matchingSkills: baselineEval.matchingSkills || [],
+    missingSkills: baselineEval.missingSkills || [],
+    biasScore,
+    biasFactors,
+    recommendation
+  };
 }
 
 module.exports = { runBiasSimulations };
